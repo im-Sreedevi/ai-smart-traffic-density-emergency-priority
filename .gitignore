@@ -1,0 +1,11 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+videos/
+*.mp4
+*.avi
+*.mov
+*.mkv
+yolov8n.pt
+.DS_Store
