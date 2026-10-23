@@ -1,6 +1,6 @@
 """
 AI-Based Smart Traffic Density Analysis with Emergency Vehicle Prioritization
-Streamlit demo app — supports both uploaded video and live webcam input.
+Streamlit demo app — supports uploaded video, browser webcam, and RTSP / IP camera streams.
 
 Setup:
     1. Place trained `emergency_classifier.h5` (downloaded from the Colab
@@ -10,8 +10,17 @@ Setup:
 """
 
 import os
+
+# Must be set BEFORE importing cv2: use TCP for RTSP (more reliable than UDP,
+# avoids smeared / corrupted frames) and time out instead of hanging forever.
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    "rtsp_transport;tcp|stimeout;5000000",
+)
+
 import time
 import tempfile
+import threading
 
 import cv2
 import numpy as np
@@ -30,6 +39,7 @@ st.set_page_config(
 VEHICLE_CLASSES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
 IMG_SIZE = (224, 224)
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "emergency_classifier.h5")
+STREAM_TIMEOUT_S = 10  # give up if no new frame arrives for this long
 
 
 @st.cache_resource(show_spinner="Loading YOLOv8 vehicle detector...")
@@ -142,8 +152,68 @@ def process_one_frame(frame, conf, low_thresh, high_thresh, min_green, max_green
     return frame, {"count": count, "density": dlevel, "green_time": gtime, "emergency": emergency_present}
 
 
+class LatestFrameReader:
+    """Reads a stream in a background thread and keeps ONLY the newest frame.
+
+    Without this, OpenCV buffers old frames while the model is busy, so the
+    output drifts further and further behind real time. Here, slow processing
+    simply means skipped frames, never lag.
+    """
+
+    def __init__(self, source):
+        # "0", "1" -> local camera index; anything else -> URL or file path
+        src = int(source) if str(source).strip().isdigit() else str(source).strip()
+        self.cap = cv2.VideoCapture(src)
+        try:
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+        # A local file would otherwise be read as fast as possible. Pace it at
+        # its own FPS so it behaves like a real live camera (and loop it).
+        self.is_file = isinstance(src, str) and os.path.isfile(src)
+        self.frame_delay = 0.0
+        if self.is_file:
+            self.frame_delay = 1.0 / (self.cap.get(cv2.CAP_PROP_FPS) or 25)
+        self._lock = threading.Lock()
+        self._frame = None
+        self._stopped = False
+        self.last_ok = time.time()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        if self.cap.isOpened():
+            self._thread.start()
+
+    def is_opened(self):
+        return self.cap.isOpened()
+
+    def _loop(self):
+        while not self._stopped:
+            ret, frame = self.cap.read()
+            if not ret:
+                if self.is_file:
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # loop the file
+                time.sleep(0.05)
+                continue
+            with self._lock:
+                self._frame = frame
+                self.last_ok = time.time()
+            if self.frame_delay:
+                time.sleep(self.frame_delay)
+
+    def read(self):
+        """Return the newest unseen frame, or None if there isn't one yet."""
+        with self._lock:
+            frame, self._frame = self._frame, None
+        return frame
+
+    def release(self):
+        self._stopped = True
+        if self._thread.is_alive():
+            self._thread.join(timeout=1)
+        self.cap.release()
+
+
 st.sidebar.title("🚦 Settings")
-mode = st.sidebar.radio("Input mode", ["Upload Video", "Live Webcam"])
+mode = st.sidebar.radio("Input mode", ["Upload Video", "Live Webcam", "RTSP / IP Camera"])
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Detection")
@@ -161,6 +231,9 @@ max_green = st.sidebar.slider("Max green time (s)", 30, 90, 60)
 
 if mode == "Upload Video":
     frame_skip = st.sidebar.slider("Process every Nth frame", 1, 10, 3)
+
+if mode == "RTSP / IP Camera":
+    proc_width = st.sidebar.slider("Processing width (px) - lower = faster", 320, 1280, 640, 64)
 
 
 st.title("AI-Based Smart Traffic Density Analysis")
@@ -248,7 +321,7 @@ if mode == "Upload Video":
             st.bar_chart(log_df["density"].value_counts())
 
 
-else:
+elif mode == "Live Webcam":
     st.info(
         "Live webcam mode uses your browser's camera. Click **Start** below and "
         "allow camera access. Detected vehicles and emergency status are overlaid "
@@ -289,6 +362,95 @@ else:
             "```\npip install streamlit-webrtc av\n```\n\n"
             "Then restart the app. In the meantime, use **Upload Video** mode instead."
         )
+
+
+else:  # RTSP / IP Camera
+    st.info(
+        "Enter the stream URL of an IP camera, then tick **Run stream**. "
+        "Untick it to stop. Examples:\n\n"
+        "- RTSP camera: `rtsp://user:pass@192.168.1.50:554/stream1`\n"
+        "- Phone (IP Webcam app): `http://192.168.1.20:8080/video`\n"
+        "- Local video file (for testing): `C:/Users/you/Downloads/traffic.mp4`\n"
+        "- Local camera index: `0`"
+    )
+
+    stream_url = st.text_input(
+        "Stream URL",
+        value=st.session_state.get("stream_url", ""),
+        placeholder="rtsp://username:password@192.168.1.50:554/stream1",
+    )
+    st.session_state["stream_url"] = stream_url
+
+    run = st.checkbox("▶️ Run stream", key="rtsp_run")
+
+    alert_ph = st.empty()
+    frame_ph = st.empty()
+    m1, m2, m3, m4 = st.columns(4)
+    count_ph, dens_ph, green_ph, fps_ph = m1.empty(), m2.empty(), m3.empty(), m4.empty()
+    status_ph = st.empty()
+
+    if run:
+        if not stream_url.strip():
+            st.warning("Please enter a stream URL first.")
+        else:
+            status_ph.info("Connecting to stream...")
+            reader = LatestFrameReader(stream_url)
+
+            try:
+                if not reader.is_opened():
+                    status_ph.error(
+                        "Could not open the stream. Check the URL, username/password, "
+                        "and that the camera is on the same network as this computer."
+                    )
+                else:
+                    smoothed_fps = 0.0
+                    n_frames = 0
+                    while True:
+                        frame = reader.read()
+
+                        if frame is None:
+                            if time.time() - reader.last_ok > STREAM_TIMEOUT_S:
+                                status_ph.error(
+                                    f"No frames received for {STREAM_TIMEOUT_S}s. "
+                                    "The stream may have dropped or ended. "
+                                    "Untick and re-tick **Run stream** to reconnect."
+                                )
+                                break
+                            time.sleep(0.01)
+                            continue
+
+                        status_ph.empty()
+
+                        h0, w0 = frame.shape[:2]
+                        if w0 > proc_width:
+                            frame = cv2.resize(frame, (proc_width, int(h0 * proc_width / w0)))
+
+                        t0 = time.time()
+
+                        frame, stats = process_one_frame(
+                            frame, conf, low_thresh, high_thresh, min_green, max_green,
+                            cls_threshold, min_crop_size
+                        )
+
+                        dt = max(time.time() - t0, 1e-6)
+                        n_frames += 1
+                        if n_frames > 1:  # first frame includes model warm-up, ignore it
+                            smoothed_fps = (1 / dt) if smoothed_fps == 0 else 0.8 * smoothed_fps + 0.2 * (1 / dt)
+
+                        frame_ph.image(frame, channels="BGR", output_format="JPEG", use_container_width=True)
+                        count_ph.metric("Vehicles", stats["count"])
+                        dens_ph.metric("Density", stats["density"])
+                        green_ph.metric("Green time", "OVERRIDE" if stats["emergency"] else f"{stats['green_time']} s")
+                        fps_ph.metric("Processing FPS", f"{smoothed_fps:.1f}")
+
+                        if stats["emergency"]:
+                            alert_ph.error("🚨 Emergency vehicle detected — signal override active")
+                        else:
+                            alert_ph.success("Normal operation — adaptive green timing")
+            finally:
+                # Runs when the loop breaks OR when Streamlit stops the script
+                # (e.g. you untick the checkbox), so the camera is always released.
+                reader.release()
 
 
 st.markdown("---")
